@@ -1,12 +1,17 @@
-// use fasthash::Murmur3Hasher;
-
-// pub type MurMap<K, V> = DashMap<K, V, Murmur3Hasher>;
-
 pub mod broker;
-pub mod subscriber;
+pub mod cmd_parse;
 
 #[derive(Clone)]
 pub struct Message {
-    channel_name: String,
-    message: String,
+	channel_name: String,
+	message: String,
 }
+
+pub enum SomeMsg {
+    SubscriptionResponse(String),
+    PublishedMessage {
+        channel_name: String,
+        message: String,
+    }
+}
+
