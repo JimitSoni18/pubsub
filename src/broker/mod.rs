@@ -9,18 +9,31 @@ use tokio::sync::mpsc;
 #[derive(Default)]
 pub struct Broker {
 	// channel name -> client ids
-	channels: DashMap<String, DashSet<u64>>,
-	subscribers: DashMap<u64, mpsc::Sender<Message>>,
+	channels: DashMap<String, DashSet<ClientId>>, // TODO: use Arc<str> or something lighter for channel
+	// names?
+	subscribers: DashMap<ClientId, mpsc::Sender<Message>>,
 	seq: AtomicU64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct ClientId(u64);
+
+// as ClientId should not be created form u64, the broker depends on the guarantee that the client
+// id will always have a corresponding channel
+#[allow(clippy::from_over_into)]
+impl Into<u64> for ClientId {
+	fn into(self) -> u64 {
+		self.0
+	}
+}
+
 pub struct Client {
-	id: u64,
+	id: ClientId,
 	rx: mpsc::Receiver<Message>,
 }
 
 impl Client {
-	pub fn id(&self) -> u64 {
+	pub fn id(&self) -> ClientId {
 		self.id
 	}
 
@@ -40,15 +53,15 @@ impl Broker {
 		Client { id, rx }
 	}
 
-	pub fn subscribe(&self, channel: String, client: &Client) -> Result<(), SubscribeError> {
-		if self.subscribers.get(&client.id).is_none() {
+	pub fn subscribe(&self, channel: String, client_id: ClientId) -> Result<(), SubscribeError> {
+		if self.subscribers.get(&client_id).is_none() {
 			// this should never be true
 			return Err(SubscribeError::ClientNotRegistered);
 		}
 
 		match self.channels.entry(channel) {
 			dashmap::Entry::Occupied(occupied_entry) => {
-				occupied_entry.get().insert(client.id());
+				occupied_entry.get().insert(client_id);
 			}
 			_ => return Err(SubscribeError::ChannelNotFound),
 		}
@@ -57,12 +70,15 @@ impl Broker {
 	}
 
 	/// unsubscribe from a particular channel
-	pub fn unsubscribe(&self, channel: String, client: &Client) -> Result<(), UnsubscribeError> {
-		// FIXME: should not panic
+	pub fn unsubscribe(
+		&self,
+		channel: String,
+		client_id: ClientId,
+	) -> Result<(), UnsubscribeError> {
 		self.channels
 			.get(&channel)
 			.ok_or(UnsubscribeError::ChannelNotFound)?
-			.remove(&client.id())
+			.remove(&client_id)
 			.ok_or(UnsubscribeError::AlreadyNotSubscribed)?;
 
 		Ok(())
@@ -70,14 +86,14 @@ impl Broker {
 
 	// TODO: return count/list?
 	/// unsubscibe from all channels
-	pub fn unsubscribe_all(&self, subscriber: &Client) {
+	pub fn unsubscribe_all(&self, client_id: ClientId) {
 		self.channels.iter().for_each(|set| {
-			set.remove(&subscriber.id());
+			set.remove(&client_id);
 		});
 	}
 
-	pub(super) fn issue_id(&self) -> u64 {
-		self.seq.fetch_add(1, Ordering::Relaxed)
+	pub(super) fn issue_id(&self) -> ClientId {
+		ClientId(self.seq.fetch_add(1, Ordering::Relaxed))
 	}
 
 	pub async fn publish(
@@ -108,13 +124,26 @@ impl Broker {
 		}))
 		.await
 		.into_iter()
-		.filter(|b| *b)
+		.filter(|b| !b)
 		.count();
 
 		Ok(count)
 	}
 
-	// TODO: unregister/destroy client?
+	// maybe just return bool?: true -> channel created; false -> channel already exists
+	// and then:
+	// #[must_use]
+	pub fn new_channel(&self, channel_name: String) -> Result<(), NewChannelError> {
+		if self.channels.contains_key(&channel_name) {
+			return Err(NewChannelError::ChannelAlreadyExists);
+		}
+
+		self.channels.insert(channel_name, Default::default());
+
+		Ok(())
+	}
+
+	// TODO: unregister/destroy client?; 48 hours later: not planned
 }
 
 #[derive(Debug)]
@@ -124,9 +153,15 @@ pub enum SubscribeError {
 }
 
 #[derive(Debug)]
+pub enum NewChannelError {
+	ChannelAlreadyExists,
+}
+
+#[derive(Debug)]
 pub enum UnsubscribeError {
 	ChannelNotFound,
 	AlreadyNotSubscribed,
+	SubscriberMissing,
 }
 
 #[derive(Debug)]
