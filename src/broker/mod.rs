@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+	borrow::Cow,
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::Message;
 
@@ -7,9 +10,9 @@ use tokio::sync::mpsc;
 
 // TODO: use Arc<str> for channel name
 #[derive(Default)]
-pub struct Broker {
+pub struct Broker<'a> {
 	// channel name -> client ids
-	channels: DashMap<String, DashSet<ClientId>>, // TODO: use Arc<str> or something lighter for channel
+	channels: DashMap<Cow<'a, str>, DashSet<ClientId>>, // TODO: use Arc<str> or something lighter for channel
 	// names?
 	subscribers: DashMap<ClientId, mpsc::Sender<Message>>,
 	seq: AtomicU64,
@@ -44,7 +47,7 @@ impl Client {
 
 pub const MESSAGE_CHANNEL_QUEUE_LIMIT: usize = 8;
 
-impl Broker {
+impl<'a> Broker<'a> {
 	pub fn new_client(&self) -> Client {
 		let (tx, rx) = mpsc::channel::<Message>(MESSAGE_CHANNEL_QUEUE_LIMIT);
 		let id = self.issue_id();
@@ -59,7 +62,7 @@ impl Broker {
 			return Err(SubscribeError::ClientNotRegistered);
 		}
 
-		match self.channels.entry(channel) {
+		match self.channels.entry(Cow::Owned(channel)) {
 			dashmap::Entry::Occupied(occupied_entry) => {
 				occupied_entry.get().insert(client_id);
 			}
@@ -70,13 +73,9 @@ impl Broker {
 	}
 
 	/// unsubscribe from a particular channel
-	pub fn unsubscribe(
-		&self,
-		channel: String,
-		client_id: ClientId,
-	) -> Result<(), UnsubscribeError> {
+	pub fn unsubscribe(&self, channel: &str, client_id: ClientId) -> Result<(), UnsubscribeError> {
 		self.channels
-			.get(&channel)
+			.get(&*Cow::Borrowed(channel))
 			.ok_or(UnsubscribeError::ChannelNotFound)?
 			.remove(&client_id)
 			.ok_or(UnsubscribeError::AlreadyNotSubscribed)?;
@@ -98,12 +97,12 @@ impl Broker {
 
 	pub async fn publish(
 		&self,
-		channel_name: &String,
+		channel_name: &str,
 		message: Message,
 	) -> Result<usize, PublishError> {
 		let subscriber_ids = self
 			.channels
-			.get(channel_name)
+			.get(&*Cow::Borrowed(channel_name))
 			.ok_or(PublishError::ChannelNotFound)?;
 
 		let count = futures::future::join_all(subscriber_ids.iter().filter_map(|id| {
@@ -133,12 +132,14 @@ impl Broker {
 	// maybe just return bool?: true -> channel created; false -> channel already exists
 	// and then:
 	// #[must_use]
-	pub fn new_channel(&self, channel_name: String) -> Result<(), NewChannelError> {
-		if self.channels.contains_key(&channel_name) {
+	pub fn create_channel(&self, channel_name: &str) -> Result<(), NewChannelError> {
+		let channel_name = Cow::Borrowed(channel_name);
+		if self.channels.contains_key(&*channel_name) {
 			return Err(NewChannelError::ChannelAlreadyExists);
 		}
 
-		self.channels.insert(channel_name, Default::default());
+		self.channels
+			.insert(Cow::Owned(channel_name.into_owned()), Default::default());
 
 		Ok(())
 	}

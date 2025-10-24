@@ -36,7 +36,7 @@ mod tests {
 		let fx_message = "abc 123".to_string();
 		let fx_message_clone = fx_message.clone();
 
-		broker.new_channel(fx_new_channel_name.clone()).unwrap();
+		broker.create_channel(&fx_new_channel_name).unwrap();
 
 		broker
 			.subscribe(fx_new_channel_name_clone, client_id)
