@@ -1,20 +1,23 @@
 use std::{
 	borrow::Cow,
+	default,
+	hash::Hash,
 	sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::Message;
 
 use dashmap::{DashMap, DashSet};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Sender};
 
 // TODO: use Arc<str> for channel name
 #[derive(Default)]
-pub struct Broker<'a> {
+pub struct Broker<'a, M> {
 	// channel name -> client ids
-	channels: DashMap<Cow<'a, str>, DashSet<ClientId>>, // TODO: use Arc<str> or something lighter for channel
+	// TODO: use Arc<str> or something lighter for channel
+	channels: DashMap<Cow<'a, str>, DashSet<ClientId>>,
 	// names?
-	subscribers: DashMap<ClientId, mpsc::Sender<Message>>,
+	subscribers: DashMap<ClientId, mpsc::Sender<M>>,
 	seq: AtomicU64,
 }
 
@@ -30,30 +33,30 @@ impl Into<u64> for ClientId {
 	}
 }
 
-pub struct Client {
+pub struct Client<M> {
 	id: ClientId,
-	rx: mpsc::Receiver<Message>,
+	rx: mpsc::Receiver<M>,
 }
 
-impl Client {
+impl<M> Client<M> {
 	pub fn id(&self) -> ClientId {
 		self.id
 	}
 
-	pub fn receiver(&mut self) -> &mut mpsc::Receiver<Message> {
+	pub fn receiver(&mut self) -> &mut mpsc::Receiver<M> {
 		&mut self.rx
 	}
 }
 
 pub const MESSAGE_CHANNEL_QUEUE_LIMIT: usize = 8;
 
-impl<'a> Broker<'a> {
-	pub fn new_client(&self) -> Client {
-		let (tx, rx) = mpsc::channel::<Message>(MESSAGE_CHANNEL_QUEUE_LIMIT);
+impl<'a, M> Broker<'a, M> {
+	pub fn new_client(&self) -> (Sender<M>, Client<M>) {
+		let (tx, rx) = mpsc::channel::<M>(MESSAGE_CHANNEL_QUEUE_LIMIT);
 		let id = self.issue_id();
-		self.subscribers.insert(id, tx);
+		self.subscribers.insert(id, tx.clone());
 
-		Client { id, rx }
+		(tx, Client::<M> { id, rx })
 	}
 
 	pub fn subscribe(&self, channel: String, client_id: ClientId) -> Result<(), SubscribeError> {
@@ -95,11 +98,10 @@ impl<'a> Broker<'a> {
 		ClientId(self.seq.fetch_add(1, Ordering::Relaxed))
 	}
 
-	pub async fn publish(
-		&self,
-		channel_name: &str,
-		message: Message,
-	) -> Result<usize, PublishError> {
+	pub async fn publish(&self, channel_name: &str, message: M) -> Result<usize, PublishError>
+	where
+		M: Clone,
+	{
 		let subscriber_ids = self
 			.channels
 			.get(&*Cow::Borrowed(channel_name))

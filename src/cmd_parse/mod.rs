@@ -29,6 +29,7 @@ pub enum ChanList<'a> {
 	Many(Vec<&'a str>),
 }
 
+#[non_exhaustive]
 pub enum Command<'a> {
 	Pub { channel: &'a str, message: &'a str },
 	Sub { channels: Vec<&'a str> },
