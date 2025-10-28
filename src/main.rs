@@ -1,7 +1,7 @@
 use std::{net::Ipv4Addr, sync::Arc};
 
 use futures::{SinkExt, StreamExt};
-use pubsub::{Message, broker::Broker};
+use pubsub::broker::Broker;
 use tokio_util::{
 	bytes::Bytes,
 	codec::{Framed, LengthDelimitedCodec},
@@ -13,19 +13,24 @@ use cmd_parse::parse_cmd;
 
 use crate::cmd_parse::{ChanList, Command};
 
+#[derive(Clone, Eq, PartialEq)]
+enum Message {
+	ClientMessage(Arc<str>),
+	PublishCommandResponse,
+}
+
 #[tokio::main]
 async fn main() {
 	let tcp_listener = tokio::net::TcpListener::bind((Ipv4Addr::new(0, 0, 0, 0), 8008))
 		.await
 		.expect("failed to connect to socket!");
 
-	let broker = Arc::new(Broker::<Message>::default());
+	let broker = Arc::new(Broker::<Message>::new());
 
 	loop {
 		let (stream, addr) = tcp_listener.accept().await.unwrap();
 		let broker = broker.clone();
-		let (tx, client) = broker.new_client();
-		let client_id = client.id();
+		let (rx, client) = broker.new_client();
 		let mut framed = Framed::new(stream, LengthDelimitedCodec::default());
 
 		// let jh0 = tokio::spawn(async {
@@ -43,28 +48,39 @@ async fn main() {
 						if let Ok(msg) = parse_cmd(message) {
 							match msg {
 								Command::Pub { channel, message } => {
+									if let Err(why) = broker
+										.publish(
+											channel,
+											Message::ClientMessage(Arc::from(message)),
+										)
+										.await
+									{
+										// TODO: client.sender.send(what?);
+									}
 									// FIXME: send using tx instead of framed.send
 									// framed.send(Bytes::from("wtf")).await.unwrap();
 								}
-								Command::Sub { channels } => {
-									for channel in channels {
-										// FIXME: channel not created: add CreateChannel variant to Command
-										broker.subscribe(channel.to_string(), client_id).unwrap();
-									}
-								}
 								Command::UnSub { channels } => match channels {
 									ChanList::All => {
-										broker.unsubscribe_all(client_id);
+										broker.unsubscribe_all(&client);
 									}
 									ChanList::Many(channels) => {
 										for channel in channels {
-											broker.unsubscribe(channel, client_id).unwrap();
+											broker.unsubscribe(channel, &client).unwrap();
 										}
 									}
 								},
-								Command::PSub { channel_patterns } => todo!(),
-								Command::PUnSub { channel_patterns } => todo!(),
-								Command::PubSub(pub_sub_sub_cmd) => todo!(),
+								Command::Sub { channels } => {
+									for channel in channels {
+										// FIXME: channel not created: add CreateChannel variant to Command
+										broker
+											.subscribe(channel.to_string(), client.clone())
+											.unwrap();
+									}
+								}
+								Command::PSub { channel_patterns } => unimplemented!(),
+								Command::PUnSub { channel_patterns } => unimplemented!(),
+								Command::PubSub(pub_sub_sub_cmd) => unimplemented!(),
 								_ => unreachable!(),
 							}
 						} else {
@@ -99,27 +115,24 @@ mod tests {
 	use std::sync::{Arc, LazyLock};
 
 	use super::*;
-	static BROKER: LazyLock<Broker<Message>> = LazyLock::new(Broker::default);
+	static BROKER: LazyLock<Broker<Message>> = LazyLock::new(Broker::new);
 
 	#[tokio::test]
 	pub async fn test_static_broker() {
-		let (tx, mut client) = BROKER.new_client();
-		let client_id = client.id();
+		let (mut rx, client) = BROKER.new_client();
 
 		let fx_new_channel_name = "test-chan-1";
 		let fx_new_channel_name_clone = "test-chan-1".to_string();
 
-		let fx_message: Arc<str> = Arc::from("abc 123");
+		let fx_message = Message::ClientMessage(Arc::from("abc 123"));
 		let fx_message_clone = fx_message.clone();
 
 		BROKER.create_channel(fx_new_channel_name).unwrap();
 
-		BROKER
-			.subscribe(fx_new_channel_name_clone, client_id)
-			.unwrap();
+		BROKER.subscribe(fx_new_channel_name_clone, client).unwrap();
 
 		let jh = tokio::spawn(async move {
-			let Some(msg) = client.receiver().recv().await else {
+			let Some(msg) = rx.recv().await else {
 				panic!("did not receive any message!");
 			};
 
@@ -141,8 +154,7 @@ mod tests {
 	#[tokio::test]
 	pub async fn test_subscribe_publish_unsubscribe_all() {
 		let broker = Broker::default();
-		let (tx, mut client) = broker.new_client();
-		let client_id = client.id();
+		let (mut rx, client) = broker.new_client();
 
 		let fx_new_channel_name = "test-chan-1";
 		let fx_new_channel_name_clone = "test-chan-1".to_string();
@@ -152,12 +164,10 @@ mod tests {
 
 		broker.create_channel(fx_new_channel_name).unwrap();
 
-		broker
-			.subscribe(fx_new_channel_name_clone, client_id)
-			.unwrap();
+		broker.subscribe(fx_new_channel_name_clone, client).unwrap();
 
 		let jh = tokio::spawn(async move {
-			let Some(msg) = client.receiver().recv().await else {
+			let Some(msg) = rx.recv().await else {
 				panic!("did not receive any message!");
 			};
 

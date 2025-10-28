@@ -2,12 +2,14 @@
 pub enum CommandParsingError {
 	// General errors
 	MalformedCommand,
+    // TODO: remove this?
 	UnknownCommand,
 	ChannelNameNotAscii,
 
 	PubWithBadArgs,
 	PubWithNoArgs,
 
+    // TODO: why not used
 	SubWithNoArgs,
 
 	PSubWithNoArgs,

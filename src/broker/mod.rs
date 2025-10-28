@@ -1,73 +1,84 @@
 use std::{
 	borrow::Cow,
-	default,
 	hash::Hash,
 	sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::Message;
-
 use dashmap::{DashMap, DashSet};
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc;
+
+#[derive(Clone)]
+pub struct ClientSubscription<M> {
+	id: u64,
+	tx: mpsc::Sender<M>,
+}
+
+impl<M> Hash for ClientSubscription<M> {
+	// depends on the guarantee that each client will have a unique id
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		self.id.hash(state);
+	}
+}
+
+impl<M> PartialEq for ClientSubscription<M> {
+	fn eq(&self, other: &Self) -> bool {
+		self.id.eq(&other.id)
+	}
+}
+
+impl<M> Eq for ClientSubscription<M> {}
+
+impl<M> ClientSubscription<M> {
+	pub fn sender(&mut self) -> &mut mpsc::Sender<M> {
+		&mut self.tx
+	}
+
+	pub fn id(&self) -> u64 {
+		self.id
+	}
+}
 
 // TODO: use Arc<str> for channel name
 #[derive(Default)]
 pub struct Broker<'a, M> {
 	// channel name -> client ids
 	// TODO: use Arc<str> or something lighter for channel
-	channels: DashMap<Cow<'a, str>, DashSet<ClientId>>,
+	// TODO: do channel name -> ClientSubscription instead
+	channels: DashMap<Cow<'a, str>, DashSet<ClientSubscription<M>>>,
 	// names?
-	subscribers: DashMap<ClientId, mpsc::Sender<M>>,
+	// subscribers: DashMap<ClientId, mpsc::Sender<M>>,
 	seq: AtomicU64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
-pub struct ClientId(u64);
-
-// as ClientId should not be created form u64, the broker depends on the guarantee that the client
-// id will always have a corresponding channel
-#[allow(clippy::from_over_into)]
-impl Into<u64> for ClientId {
-	fn into(self) -> u64 {
-		self.0
-	}
-}
-
-pub struct Client<M> {
-	id: ClientId,
-	rx: mpsc::Receiver<M>,
-}
-
-impl<M> Client<M> {
-	pub fn id(&self) -> ClientId {
-		self.id
-	}
-
-	pub fn receiver(&mut self) -> &mut mpsc::Receiver<M> {
-		&mut self.rx
-	}
 }
 
 pub const MESSAGE_CHANNEL_QUEUE_LIMIT: usize = 8;
 
 impl<'a, M> Broker<'a, M> {
-	pub fn new_client(&self) -> (Sender<M>, Client<M>) {
-		let (tx, rx) = mpsc::channel::<M>(MESSAGE_CHANNEL_QUEUE_LIMIT);
-		let id = self.issue_id();
-		self.subscribers.insert(id, tx.clone());
-
-		(tx, Client::<M> { id, rx })
+	pub fn new() -> Self {
+		Self {
+			channels: Default::default(),
+			seq: Default::default(),
+		}
 	}
 
-	pub fn subscribe(&self, channel: String, client_id: ClientId) -> Result<(), SubscribeError> {
-		if self.subscribers.get(&client_id).is_none() {
-			// this should never be true
-			return Err(SubscribeError::ClientNotRegistered);
-		}
+	pub fn new_client(&self) -> (mpsc::Receiver<M>, ClientSubscription<M>) {
+		let (tx, rx) = mpsc::channel::<M>(MESSAGE_CHANNEL_QUEUE_LIMIT);
+		(
+			rx,
+			ClientSubscription {
+				tx,
+				id: self.seq.fetch_add(1, Ordering::Relaxed),
+			},
+		)
+	}
 
+	pub fn subscribe(
+		&self,
+		channel: String,
+		client: ClientSubscription<M>,
+	) -> Result<(), SubscribeError> {
 		match self.channels.entry(Cow::Owned(channel)) {
 			dashmap::Entry::Occupied(occupied_entry) => {
-				occupied_entry.get().insert(client_id);
+				occupied_entry.get().insert(client);
 			}
 			_ => return Err(SubscribeError::ChannelNotFound),
 		}
@@ -76,56 +87,72 @@ impl<'a, M> Broker<'a, M> {
 	}
 
 	/// unsubscribe from a particular channel
-	pub fn unsubscribe(&self, channel: &str, client_id: ClientId) -> Result<(), UnsubscribeError> {
+	pub fn unsubscribe(
+		&self,
+		channel: &str,
+		client: &ClientSubscription<M>,
+	) -> Result<(), UnsubscribeError> {
 		self.channels
 			.get(&*Cow::Borrowed(channel))
 			.ok_or(UnsubscribeError::ChannelNotFound)?
-			.remove(&client_id)
+			.remove(client)
 			.ok_or(UnsubscribeError::AlreadyNotSubscribed)?;
 
 		Ok(())
 	}
 
-	// TODO: return count/list?
-	/// unsubscibe from all channels
-	pub fn unsubscribe_all(&self, client_id: ClientId) {
-		self.channels.iter().for_each(|set| {
-			set.remove(&client_id);
-		});
+	// TODO: returl count/list of channels unsubscribed?
+	// TODO: return error in case channel not found or client not subscribed
+	/// unsubscribe from many channels
+	pub fn unsubscribe_many(
+		&self,
+		channels: impl IntoIterator<Item = impl AsRef<str>>,
+		client: &ClientSubscription<M>,
+	) {
+		for channel in channels {
+			if let Some(subscription_set) = self.channels.get(&*Cow::Borrowed(channel.as_ref())) {
+				subscription_set.remove(client);
+			}
+		}
 	}
 
-	pub(super) fn issue_id(&self) -> ClientId {
-		ClientId(self.seq.fetch_add(1, Ordering::Relaxed))
+	// TODO: return count/list?
+	/// unsubscibe from all channels
+	pub fn unsubscribe_all(&self, client: &ClientSubscription<M>) {
+		self.channels.iter().for_each(|set| {
+			set.remove(client);
+		});
 	}
 
 	pub async fn publish(&self, channel_name: &str, message: M) -> Result<usize, PublishError>
 	where
 		M: Clone,
 	{
-		let subscriber_ids = self
+		let subscribers = self
 			.channels
 			.get(&*Cow::Borrowed(channel_name))
 			.ok_or(PublishError::ChannelNotFound)?;
 
-		let count = futures::future::join_all(subscriber_ids.iter().filter_map(|id| {
-			self.subscribers.get(&id).map(|sender| {
-				let msg_clone = message.clone();
-				async move {
-					// if it errors out, it means receiver is dropped
-					let rx_dropped = sender.send(msg_clone).await.is_err();
-					if rx_dropped {
-						self.subscribers.remove(&id);
-						self.channels.iter().for_each(|c| {
-							c.remove(&id);
-						});
-					}
-					rx_dropped
-				}
-			})
+		let count = futures::future::join_all(subscribers.iter().map(|client| {
+			let message = message.clone();
+            // cloned so we don't get Vec<RefMulti>, which causes deadlock in the
+            // `subscribers.remove()` below
+            let client = client.clone();
+			async move {
+				(
+                    client.tx.send(message.clone()).await.is_ok(),
+					client,
+				)
+			}
 		}))
 		.await
 		.into_iter()
-		.filter(|b| !b)
+		.filter(|result| {
+			if result.0 {
+				subscribers.remove(&result.1);
+			}
+			result.0
+		})
 		.count();
 
 		Ok(count)
