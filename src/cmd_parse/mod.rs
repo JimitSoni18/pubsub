@@ -2,14 +2,14 @@
 pub enum CommandParsingError {
 	// General errors
 	MalformedCommand,
-    // TODO: remove this?
+	// TODO: remove this?
 	UnknownCommand,
 	ChannelNameNotAscii,
 
 	PubWithBadArgs,
 	PubWithNoArgs,
 
-    // TODO: why not used
+	// TODO: why not used
 	SubWithNoArgs,
 
 	PSubWithNoArgs,
@@ -150,4 +150,3 @@ pub fn parse_cmd(cmd: &str) -> Result<Command, CommandParsingError> {
 		_ => Err(CommandParsingError::MalformedCommand),
 	}
 }
-

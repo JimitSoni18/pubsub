@@ -135,15 +135,10 @@ impl<'a, M> Broker<'a, M> {
 
 		let count = futures::future::join_all(subscribers.iter().map(|client| {
 			let message = message.clone();
-            // cloned so we don't get Vec<RefMulti>, which causes deadlock in the
-            // `subscribers.remove()` below
-            let client = client.clone();
-			async move {
-				(
-                    client.tx.send(message.clone()).await.is_ok(),
-					client,
-				)
-			}
+			// cloned so we don't get Vec<RefMulti>, which causes deadlock in the
+			// `subscribers.remove()` below
+			let client = client.clone();
+			async move { (client.tx.send(message.clone()).await.is_ok(), client) }
 		}))
 		.await
 		.into_iter()
